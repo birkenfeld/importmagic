@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import sys
+import hashlib
+from six.moves import cPickle as pickle
 from contextlib import contextmanager
 from distutils import sysconfig
 
@@ -18,6 +20,8 @@ LIB_LOCATIONS = sorted(set((
     (sysconfig.get_python_lib(standard_lib=True, prefix=sys.prefix), 'S'),
     (sysconfig.get_python_lib(plat_specific=True, prefix=sys.prefix), '3'),
 )), key=lambda l: -len(l[0]))
+
+CACHE_LOCATION = os.path.join(os.path.expanduser('~'), '.cache', 'importmagic')
 
 
 # Regex matching modules that we never attempt to index.
@@ -52,6 +56,31 @@ class JSONEncoder(json.JSONEncoder):
         return super(JSONEncoder, self).default(o)
 
 
+def cached(method):
+    def new_method(self, filename, *args, **kwds):
+        if not self._cache_enabled or not filename:
+            return method(self, filename, *args, **kwds)
+        hash_base = (repr(filename) + str(os.path.getmtime(filename))).encode()
+        sourcehash = hashlib.sha1(hash_base).hexdigest()
+        cachefile = os.path.join(CACHE_LOCATION, sourcehash)
+        try:
+            if not os.path.isdir(CACHE_LOCATION):
+                os.makedirs(CACHE_LOCATION)
+            with open(cachefile, 'rb') as fp:
+                result = pickle.load(fp)
+        except Exception:
+            result = method(self, filename, *args, **kwds)
+            if result is not None:
+                try:
+                    with open(cachefile, 'wb') as fp:
+                        pickle.dump(result, fp)
+                except Exception:
+                    logger.debug('failed to store cache file %s' %
+                                 cachefile)
+        return result
+    return new_method
+
+
 class SymbolIndex(object):
     PACKAGE_ALIASES = {
         # Give 'os.path' a score boost over posixpath and ntpath.
@@ -69,7 +98,7 @@ class SymbolIndex(object):
     _SERIALIZED_ATTRIBUTES = {'score': 1.0, 'location': '3'}
 
     def __init__(self, name=None, parent=None, score=1.0, location='3',
-                 blacklist_re=None):
+                 blacklist_re=None, cache_enabled=None):
         self._name = name
         self._tree = {}
         self._exports = {}
@@ -80,6 +109,12 @@ class SymbolIndex(object):
             self._blacklist_re = parent._blacklist_re
         else:
             self._blacklist_re = DEFAULT_BLACKLIST_RE
+        if cache_enabled is not None:
+            self._cache_enabled = cache_enabled
+        elif parent:
+            self._cache_enabled = parent._cache_enabled
+        else:
+            self._cache_enabled = True
         self.score = score
         self.location = location
         if parent is None:
@@ -109,24 +144,32 @@ class SymbolIndex(object):
         load(tree, data, 'L')
         return tree
 
-    def index_source(self, filename, source):
+    @cached
+    def _parse_source(self, filename, source=None):
+        if source is None:
+            with open(filename) as fd:
+                source = fd.read()
         try:
             st = parse_ast(source, filename)
         except Exception as e:
             print('Failed to parse %s: %s' % (filename, e))
-            return False
-        visitor = SymbolVisitor(self)
+            return
+        visitor = SymbolVisitor()
         visitor.visit(st)
-        return True
+        return visitor.names, visitor.exports
+
+    def index_source(self, filename, source):
+        result = self._parse_source(filename, source)
+        if result:
+            self.update(*result)
 
     def index_file(self, module, filename):
         if self._blacklist_re.search(filename):
             return
-        with self.enter(module, location=self._determine_location_for(filename)) as subtree:
-            with open(filename) as fd:
-                success = subtree.index_source(filename, fd.read())
-        if not success:
-            del self._tree[module]
+        result = self._parse_source(filename)
+        if result:
+            with self.enter(module, location=self._determine_location_for(filename)) as subtree:
+                subtree.update(*result)
 
     def index_path(self, root):
         """Index a path.
@@ -134,7 +177,7 @@ class SymbolIndex(object):
         :param root: Either a package directory, a .so or a .py module.
         """
         basename = os.path.basename(root)
-        if os.path.splitext(basename)[0] != '__init__' and basename.startswith('_'):
+        if basename.startswith('_') and os.path.splitext(basename)[0] != '__init__':
             return
         location = self._determine_location_for(root)
         if os.path.isfile(root):
@@ -146,6 +189,9 @@ class SymbolIndex(object):
         basename = os.path.basename(root)
         with self.enter(basename, location=location) as subtree:
             for filename in os.listdir(root):
+                # exclude commonly found files directly
+                if filename.endswith(('.pyc', '.pyo')):
+                    continue
                 subtree.index_path(os.path.join(root, filename))
 
     def _index_module(self, root, location):
@@ -159,26 +205,30 @@ class SymbolIndex(object):
         if ext == '.py':
             self.index_file(basename, root)
         elif ext in ('.dll', '.so'):
-            self.index_builtin(import_path, location=location)
+            self.index_builtin(import_path, root, location=location)
 
-    def index_builtin(self, name, location):
-        basename = name.rsplit('.', 1)[-1]
-        if basename.startswith('_'):
-            return
+    @cached
+    def _get_builtin_names(self, filename, module):
         try:
-            module = __import__(name, fromlist=['.'])
+            module = __import__(module, fromlist=['.'])
         except Exception:
-            logger.debug('failed to index builtin module %s', name)
-            return
+            logger.debug('failed to index builtin module %s', module)
+            return []
+        return [key for key in vars(module) if not key.startswith('_')]
 
-        with self.enter(basename, location=location) as subtree:
-            for key, value in vars(module).items():
-                if not key.startswith('_'):
-                    subtree.add(key, 1.1)
+    def index_builtin(self, module, filename, location):
+        basemodule = module.rsplit('.', 1)[-1]
+        if basemodule.startswith('_'):
+            return
+        names = self._get_builtin_names(filename, module)
+        if names:
+            with self.enter(basemodule, location=location) as subtree:
+                for name in names:
+                    subtree.add(name, 1.1)
 
     def build_index(self, paths):
         for builtin in BUILTIN_MODULES:
-            self.index_builtin(builtin, location='S')
+            self.index_builtin(builtin, '', location='S')
         for path in paths:
             if os.path.isdir(path):
                 for filename in os.listdir(path):
@@ -252,9 +302,6 @@ class SymbolIndex(object):
             node = node._parent
         return '.'.join(reversed(path))
 
-    def add_explicit_export(self, name, score):
-        self._exports[name] = score
-
     def find(self, path):
         """Return the node for a path, or None."""
         path = path.split('.')
@@ -285,6 +332,12 @@ class SymbolIndex(object):
         current_score = self._tree.get(name, 0.0)
         if isinstance(current_score, float) and score > current_score:
             self._tree[name] = score
+
+    def update(self, names, exports):
+        for name, score in names.items():
+            self.add(name, score)
+        for name, score in exports.items():
+            self._exports[name] = score
 
     @contextmanager
     def enter(self, name, location='L', score=1.0):
@@ -348,28 +401,29 @@ class SymbolIndex(object):
 
 
 class SymbolVisitor(ast.NodeVisitor):
-    def __init__(self, tree):
-        self._tree = tree
+    def __init__(self):
+        self.exports = {}
+        self.names = {}
 
     def visit_ImportFrom(self, node):
         for name in node.names:
             if name.name == '*' or name.name.startswith('_'):
                 continue
-            self._tree.add(name.name, 0.25)
+            self.names[name.name] = 0.25
 
     def visit_Import(self, node):
         for name in node.names:
             if name.name.startswith('_'):
                 continue
-            self._tree.add(name.name, 0.25)
+            self.names[name.name] = 0.25
 
     def visit_ClassDef(self, node):
         if not node.name.startswith('_'):
-            self._tree.add(node.name, 1.1)
+            self.names[node.name] = 1.1
 
     def visit_FunctionDef(self, node):
         if not node.name.startswith('_'):
-            self._tree.add(node.name, 1.1)
+            self.names[node.name] = 1.1
 
     def visit_Assign(self, node):
         # TODO: Handle __all__
@@ -378,9 +432,9 @@ class SymbolVisitor(ast.NodeVisitor):
             if name.id == '__all__' and isinstance(node.value, ast.List):
                 for subnode in node.value.elts:
                     if isinstance(subnode, ast.Str):
-                        self._tree.add_explicit_export(subnode.s, 1.2)
+                        self.exports[subnode.s] = 1.2
             elif not name.id.startswith('_'):
-                self._tree.add(name.id, 1.1)
+                self.names[name.id] = 1.1
 
     def visit_If(self, node):
         # NOTE: In lieu of actually parsing if/else blocks at the top-level,
