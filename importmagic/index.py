@@ -69,7 +69,7 @@ class SymbolIndex(object):
     _SERIALIZED_ATTRIBUTES = {'score': 1.0, 'location': '3'}
 
     def __init__(self, name=None, parent=None, score=1.0, location='3',
-                 blacklist_re=None):
+                 blacklist_re=None, filepath=None):
         self._name = name
         self._tree = {}
         self._exports = {}
@@ -82,13 +82,13 @@ class SymbolIndex(object):
             self._blacklist_re = DEFAULT_BLACKLIST_RE
         self.score = score
         self.location = location
+        self.filepath = [filepath]
         if parent is None:
             self._merge_aliases()
             with self.enter('__future__', location='F'):
                 pass
             with self.enter('__builtin__', location='S'):
                 pass
-        
 
     @classmethod
     def deserialize(self, file):
@@ -123,7 +123,7 @@ class SymbolIndex(object):
     def index_file(self, module, filename):
         if self._blacklist_re.search(filename):
             return
-        with self.enter(module, location=self._determine_location_for(filename)) as subtree:
+        with self.enter(module, location=self._determine_location_for(filename), filepath=filename) as subtree:
             with open(filename) as fd:
                 success = subtree.index_source(filename, fd.read())
         if not success:
@@ -145,7 +145,7 @@ class SymbolIndex(object):
 
     def _index_package(self, root, location):
         basename = os.path.basename(root)
-        with self.enter(basename, location=location) as subtree:
+        with self.enter(basename, location=location, filepath=root) as subtree:
             for filename in os.listdir(root):
                 subtree.index_path(os.path.join(root, filename))
 
@@ -172,7 +172,7 @@ class SymbolIndex(object):
             logger.debug('failed to index builtin module %s', name)
             return
 
-        with self.enter(basename, location=location) as subtree:
+        with self.enter(basename, location=location, filepath=name) as subtree:
             for key, value in vars(module).items():
                 if not key.startswith('_'):
                     subtree.add(key, 1.1)
@@ -290,17 +290,20 @@ class SymbolIndex(object):
             self._tree[name] = score
 
     @contextmanager
-    def enter(self, name, location='L', score=1.0):
+    def enter(self, name, location='L', score=1.0, filepath=None):
         if name is None:
             tree = self
         else:
             tree = self._tree.get(name)
             if not isinstance(tree, SymbolIndex):
-                tree = self._tree[name] = SymbolIndex(name, self, score=score, location=location)
+                tree = self._tree[name] = SymbolIndex(name, self, score=score,
+                                                      location=location, filepath=filepath)
                 if tree.path() in SymbolIndex._PACKAGE_ALIASES:
                     alias_path, _ = SymbolIndex._PACKAGE_ALIASES[tree.path()]
                     alias = self.find(alias_path)
                     alias._tree = tree._tree
+            else:
+                tree.filepath.append(filepath)
         yield tree
         if tree._exports:
             # Delete unexported variables
@@ -316,7 +319,7 @@ class SymbolIndex(object):
         return LOCATION_BOOSTS.get(self.location, 1.0)
 
     def __repr__(self):
-        return '<%s:%r %r>' % (self.location, self.score, self._tree)
+        return '<%s:%r %r %r>' % (self.location, self.score, self.filepath, self._tree)
 
     def _merge_aliases(self):
         def create(node, alias, score):
